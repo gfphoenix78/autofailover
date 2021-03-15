@@ -33,39 +33,39 @@ PG_MODULE_MAGIC;
 //
 
 
-PG_FUNCTION_INFO_V1(collect_status);
-PG_FUNCTION_INFO_V1(execute_action);
+//PG_FUNCTION_INFO_V1(collect_status);
+//PG_FUNCTION_INFO_V1(execute_action);
+PG_FUNCTION_INFO_V1(autofailover_execute);
+
+static void handle_promote(void);
+static void handle_syncrep(void);
+static void handle_unsyncrep(void);
 
 extern int max_wal_senders;
-// (last_role) => (running_role, sync, lsn, walconn)
-// role:
-// 	p: un-acked primary
-// 	s: un-acked secondary
-// 	P: acked primary
-// 	S: acked secondary
-// sync: 't', 'f', '?'
-// 	primary: sync with at least one secondary
-// 	secondary: sync to the peer
-// walconn: wal connection is healthy
+
+static ControlFileData *
+get_control_file() {
+  static ControlFileData *_ctl_file = NULL;
+  if (_ctl_file == NULL) {
+    bool found;
+    _ctl_file = (ControlFileData *)ShmemInitStruct("Control File",
+  					sizeof(ControlFileData), &found);
+    Assert(found && "found control file");
+  }
+  Assert(_ctl_file);
+  return _ctl_file;
+}
 
 static char probe_role()
 {
-//  ControlFileData *control_file;
-  int fd;
-//  bool found;
-  fd = open("standby.signal", O_RDONLY);
-  if (fd >= 0)
-  {
-    close(fd);
+  int rc;
+  rc = access("standby.signal", F_OK | R_OK);
+  if (rc == 0)
     return 's';
-  }
+
   if (errno != ENOENT)
     ereport(ERROR, (errmsg("open standby.signal: %m")));
-//
-//  control_file = (ControlFileData *)ShmemInitStruct("Control File",
-//  					sizeof(ControlFileData), &found);
-//  Assert(found && "found control file");
-//  if (control_file->state == DB_IN_PRODUCTION)
+
   return 'p';
 }
 
@@ -99,79 +99,207 @@ get_current_lsn()
 	}
 	return lsn;
 }
-
-Datum
-collect_status(PG_FUNCTION_ARGS)
+static void
+validate_last_role(const char *last_role)
 {
-	char role;
-	bool walconn = false;
-	const char *sync = "?";
-	XLogRecPtr lsn = 0;
 
-	TupleDesc desc;
-	TypeFuncClass funcClass;
-	HeapTuple tuple;
-	Datum resultDatum;
-	Datum values[4];
-	bool isNulls[4];
-
-	funcClass = get_call_result_type(fcinfo, NULL, &desc);
-	if (funcClass != TYPEFUNC_COMPOSITE)
-	{
-		ereport(ERROR, (errmsg("return type must be a row type")));
-	}
-
-	memset(values, 0, sizeof(values));
-	memset(isNulls, 0, sizeof(isNulls));
-
-	role = probe_role();
-
-	if (role == 'p')
-	{
-		int i;
-		for (i = 0; i < max_wal_senders; i++)
-		{
-			WalSnd *walsnd = &WalSndCtl->walsnds[i];
-			WalSndState state;
-			if (walsnd->pid == 0)
-				continue;
-			SpinLockAcquire(&walsnd->mutex);
-			state = walsnd->state;
-			SpinLockRelease(&walsnd->mutex);
-			switch (state)
-			{
-				case WALSNDSTATE_STREAMING:
-				case WALSNDSTATE_CATCHUP:
-					sync = state == WALSNDSTATE_STREAMING
-								? "streaming" : "catchup";
-					walconn = true;
-					break;
-				default:
-					break;
-			}
-			if (state == WALSNDSTATE_STREAMING)
-				break;
-		}
-	}
-	else
-	{
-		WalRcvData *walrcv = WalRcv;
-		SpinLockAcquire(&walrcv->mutex);
-		walconn = walrcv->pid != 0;
-		SpinLockRelease(&walrcv->mutex);
-
-	}
-
-	lsn = get_current_lsn();
-
-	values[0] = char_to_text_datum(role);
-	values[1] = CStringGetTextDatum(sync);
-	values[2] = UInt64GetDatum(lsn);
-	values[3] = BoolGetDatum(walconn);
-	tuple = heap_form_tuple(desc, values, isNulls);
-	resultDatum = HeapTupleGetDatum(tuple);
-	PG_RETURN_DATUM(resultDatum);
 }
+Datum
+autofailover_execute(PG_FUNCTION_ARGS)
+{
+  char role;
+  char last_role;
+  bool walconn = false;
+  const char *sync_state = "?";
+  const char *syncrep = "?";
+  volatile char **const p_standby_names = &SyncRepStandbyNames;
+  XLogRecPtr lsn;
+
+  TupleDesc desc;
+  TypeFuncClass funcClass;
+  HeapTuple tuple;
+
+  funcClass = get_call_result_type(fcinfo, NULL, &desc);
+  if (funcClass != TYPEFUNC_COMPOSITE)
+  {
+    ereport(ERROR, (errmsg("return type must be a row type")));
+  }
+  text *arg0 = PG_GETARG_TEXT_P(0);
+  char *cmd = text_to_cstring(arg0);
+
+  last_role = '?';
+  if (strcmp(cmd, "status") == 0)
+  {
+    text *arg1 = PG_GETARG_TEXT_P(1);
+    char *last_role_ = text_to_cstring(arg1);
+    validate_last_role(last_role_);
+    last_role = last_role_[0];
+  }
+  else if (strcmp(cmd, "promote") == 0)
+  {
+    handle_promote();
+  }
+  else if (strcmp(cmd, "syncrep") == 0)
+  {
+    handle_syncrep();
+  }
+  else if (strcmp(cmd, "unsyncrep") == 0)
+  {
+    // fixme: wait until the GUC is set in all backends and all next queries returns syncrep=''
+    handle_unsyncrep();
+//    LWLockAcquire(SyncRepLock, LW_SHARED);
+//    while(WalSndCtl->sync_standbys_defined)
+//    {
+//      LWLockRelease(SyncRepLock);
+//      usleep(800 * 1000);
+//      LWLockAcquire(SyncRepLock, LW_SHARED);
+//    }
+//    LWLockRelease(SyncRepLock);
+  }
+  else if (strcmp(cmd, "info") == 0)
+  {
+//	  handle_info();
+    elog(LOG, "get initial info");
+  }
+  else
+  {
+    ereport(ERROR, (errmsg("unknown action code '%s'", cmd)));
+  }
+
+  // return current status
+  Datum resultDatum;
+  Datum values[5];
+  bool isNulls[5];
+
+  memset(values, 0, sizeof(values));
+  memset(isNulls, 0, sizeof(isNulls));
+
+  role = probe_role();
+elog(LOG, "max_wal_senders=%d", max_wal_senders);
+  if (role == 'p')
+  {
+    int i;
+    LWLockAcquire(SyncRepLock, LW_SHARED);
+    for (i = 0; i < max_wal_senders; i++)
+    {
+      WalSnd *walsnd = &WalSndCtl->walsnds[i];
+      WalSndState state;
+      if (walsnd->pid == 0)
+        continue;
+      SpinLockAcquire(&walsnd->mutex);
+      state = walsnd->state;
+      SpinLockRelease(&walsnd->mutex);
+      switch (state)
+      {
+        case WALSNDSTATE_STREAMING:
+        case WALSNDSTATE_CATCHUP:
+          sync_state = state == WALSNDSTATE_STREAMING
+                 ? "streaming" : "catchup";
+          walconn = true;
+          break;
+        default:
+          break;
+      }
+      if (state == WALSNDSTATE_STREAMING)
+        break;
+    }
+    if (WalSndCtl->sync_standbys_defined)
+      syncrep = "*";
+    else
+      syncrep = "";
+    LWLockRelease(SyncRepLock);
+  }
+  else
+  {
+    WalRcvData *walrcv = WalRcv;
+    SpinLockAcquire(&walrcv->mutex);
+    walconn = walrcv->pid != 0;
+    SpinLockRelease(&walrcv->mutex);
+  }
+
+  lsn = get_current_lsn();
+
+  values[0] = char_to_text_datum(role);
+  values[1] = CStringGetTextDatum(syncrep);
+  values[2] = CStringGetTextDatum(sync_state);
+  values[3] = UInt64GetDatum(lsn);
+  values[4] = BoolGetDatum(walconn);
+  tuple = heap_form_tuple(desc, values, isNulls);
+  resultDatum = HeapTupleGetDatum(tuple);
+  PG_RETURN_DATUM(resultDatum);
+}
+//Datum
+//collect_status(PG_FUNCTION_ARGS)
+//{
+//	char role;
+//	bool walconn = false;
+//	const char *sync = "?";
+//	XLogRecPtr lsn = 0;
+//
+//	TupleDesc desc;
+//	TypeFuncClass funcClass;
+//	HeapTuple tuple;
+//	Datum resultDatum;
+//	Datum values[5];
+//	bool isNulls[5];
+//
+//	funcClass = get_call_result_type(fcinfo, NULL, &desc);
+//	if (funcClass != TYPEFUNC_COMPOSITE)
+//	{
+//		ereport(ERROR, (errmsg("return type must be a row type")));
+//	}
+//
+//	memset(values, 0, sizeof(values));
+//	memset(isNulls, 0, sizeof(isNulls));
+//
+//	role = probe_role();
+//
+//	if (role == 'p')
+//	{
+//		int i;
+//		for (i = 0; i < max_wal_senders; i++)
+//		{
+//			WalSnd *walsnd = &WalSndCtl->walsnds[i];
+//			WalSndState state;
+//			if (walsnd->pid == 0)
+//				continue;
+//			SpinLockAcquire(&walsnd->mutex);
+//			state = walsnd->state;
+//			SpinLockRelease(&walsnd->mutex);
+//			switch (state)
+//			{
+//				case WALSNDSTATE_STREAMING:
+//				case WALSNDSTATE_CATCHUP:
+//					sync = state == WALSNDSTATE_STREAMING
+//								? "streaming" : "catchup";
+//					walconn = true;
+//					break;
+//				default:
+//					break;
+//			}
+//			if (state == WALSNDSTATE_STREAMING)
+//				break;
+//		}
+//	}
+//	else
+//	{
+//		WalRcvData *walrcv = WalRcv;
+//		SpinLockAcquire(&walrcv->mutex);
+//		walconn = walrcv->pid != 0;
+//		SpinLockRelease(&walrcv->mutex);
+//
+//	}
+//
+//	lsn = get_current_lsn();
+//	values[0] = char_to_text_datum(role);
+//	values[1] = CStringGetDatum(SyncRepStandbyNames);
+//  values[2] = CStringGetTextDatum(sync);
+//  values[3] = UInt64GetDatum(lsn);
+//	values[4] = BoolGetDatum(walconn);
+//	tuple = heap_form_tuple(desc, values, isNulls);
+//	resultDatum = HeapTupleGetDatum(tuple);
+//	PG_RETURN_DATUM(resultDatum);
+//}
 
 static
 void
@@ -185,7 +313,7 @@ set_string_guc(const char *name, const char *value)
 	AlterSystemSetConfigFile(&alterSystemStmt);
 }
 
-static bool
+static void
 handle_syncrep()
 {
   if (!WalSndCtl->sync_standbys_defined)
@@ -196,9 +324,8 @@ handle_syncrep()
     DirectFunctionCall1(pg_reload_conf, PointerGetDatum(NULL) /* unused */);
     // todo: create replication slot
   }
-  return 0;
 }
-static bool
+static void
 handle_unsyncrep()
 {
   if (WalSndCtl->sync_standbys_defined)
@@ -209,7 +336,6 @@ handle_unsyncrep()
     DirectFunctionCall1(pg_reload_conf, PointerGetDatum(NULL) /* unused */);
     // todo: drop replication slot
   }
-  return 0;
 }
 
 // todo: log the possible error
@@ -223,12 +349,12 @@ SignalPromote(void)
     kill(PostmasterPid, SIGUSR1);
   }
 }
-static bool
+
+static void
 handle_promote()
 {
   ControlFileData *control_file;
   DBState state;
-  bool ok;
   // promote to primary
   ereport(LOG,
           (errmsg("promoting mirror to primary due to FTS request")));
@@ -238,9 +364,7 @@ handle_promote()
    * promotion.  Promote messages should therefore be handled in an
    * idempotent way.
    */
-  control_file = get_controlfile(".", &ok);
-  if (!ok)
-    elog(ERROR, "incorrect crc for control file");
+  control_file = get_control_file();
 
   state = control_file->state;
   if (state == DB_IN_ARCHIVE_RECOVERY)
@@ -262,11 +386,10 @@ handle_promote()
   }
   else
   {
-    elog(LOG, "ignoring promote request, walreceiver not running,"
+    elog(LOG, "ignoring promote request, not in archive recovery,"
               " DBState = %d", state);
   }
   // notifies all segments that "I am the new primary."
-  return 0;
 }
 
 static bool
@@ -280,28 +403,33 @@ handle_demote()
 // 	syncrep
 // 	unsyncrep
 // 	[demote]
-Datum
-execute_action(PG_FUNCTION_ARGS)
-{
-	text *arg0 = PG_GETARG_TEXT_P(0);
-	char *action_code = text_to_cstring(arg0);
 
-	if (strcmp(action_code, "promote") == 0)
-	{
-		handle_promote();
-	}
-	else if (strcmp(action_code, "syncrep") == 0)
-	{
-	  handle_syncrep();
-	}
-	else if (strcmp(action_code, "unsyncrep") == 0)
-	{
-	  handle_unsyncrep();
-	}
-	else
-	{
-		ereport(ERROR, (errmsg("unknown action code '%s'", action_code)));
-	}
-
-	PG_RETURN_VOID();
-}
+//Datum
+//execute_action(PG_FUNCTION_ARGS)
+//{
+//	text *arg0 = PG_GETARG_TEXT_P(0);
+//	char *action_code = text_to_cstring(arg0);
+//
+//	if (strcmp(action_code, "promote") == 0)
+//	{
+//		handle_promote();
+//	}
+//	else if (strcmp(action_code, "syncrep") == 0)
+//	{
+//	  handle_syncrep();
+//	}
+//	else if (strcmp(action_code, "unsyncrep") == 0)
+//	{
+//	  handle_unsyncrep();
+//	}
+//	else if (strcmp(action_code, "info") == 0)
+//  {
+////	  handle_info();
+//  }
+//	else
+//	{
+//		ereport(ERROR, (errmsg("unknown action code '%s'", action_code)));
+//	}
+//
+//	PG_RETURN_VOID();
+//}
