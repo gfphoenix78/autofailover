@@ -84,3 +84,9 @@ g.sync = {**unknown** | **primary_sync** | **primary_unsync** | **group_sync**}
 			if primary_time_disconnected == primary_time_updated ||
 				standby_time_disconnected == standby_time_updated:
 				// send turn on command
+
+
+g_update_node(g, node, msg):
+
+	assert node in g.nodes
+	// todo:

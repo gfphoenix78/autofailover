@@ -25,7 +25,7 @@ func (node *auto_node)connect() (*pgconn.PgConn, error) {
 // sends the result to the group manager through a shared channel owned by
 // the group manager
 const COLLECTOR_RETRY_TIMEOUT = time.Millisecond * 1000
-const COLLECTOR_IDLE_TIMEOUT  = time.Second * 2
+const COLLECTOR_IDLE_TIMEOUT  = time.Hour * 24
 
 func buildSQL(ai *ActionItem, last_role byte) string {
 	switch ai.CMD {
@@ -437,3 +437,118 @@ func (g *auto_group)run_loop()  {
 		log.Println("send command to worker, ", ai.delay)
 	}
 }
+//
+/////////////////////////////////////////////////////////////////////////////////
+///// 						NEW DESIGN										///
+/////////////////////////////////////////////////////////////////////////////////
+//
+//type AutoNode struct {
+//
+//	role byte
+//	time_updated time.Time
+//	time_walconn_disconnected time.Time
+//	fn func()
+//}
+//
+//func (node *AutoNode)syncrep() bool {
+//	return false
+//}
+//func (node *AutoNode)walconn() bool {
+//	return false
+//}
+//func (node *AutoNode)lastCMD() int {
+//	return 0
+//}
+//func (node *AutoNode)should_sync_off() bool {
+//	return false
+//}
+//type GroupSyncState int
+//const (
+//	GS_UNKNOWN GroupSyncState = iota + 1
+//	GS_UNSYNC  // primary has turned off syncrep, needs to turn it on first.
+//	GS_P_SYNC // primary has turned on syncrep, needs to write query.
+//	GS_READY // received write query, group is ready for promotion.
+//)
+//type GroupRunningState int
+//const (
+//	GRS_INIT0 GroupRunningState = iota + 1
+//	GRS_SINGLE
+//	GRS_NORMAL
+//	GRS_PROMOTING
+//)
+//type AutoGroup struct {
+//	target *AutoNode
+//
+//	active_nodes []*AutoNode
+//	demoted_nodes []*AutoNode
+//	// persistent fields
+//	running_state GroupRunningState
+//	sync_state GroupSyncState
+//}
+//
+//func (g *AutoGroup)save()  {
+//
+//}
+//
+//func node_single(g *AutoGroup, node *AutoNode, resMessage interface{})  {
+//	// do checks, update, actions
+//	// sync => unsync
+//	// promote
+//
+//	/// checks
+//	if node.role != 'p' {
+//		// TODO: not primary, do promote
+//
+//	} else if node.syncrep() {
+//		// sync => unsync
+//	}
+//}
+//
+//func primary_normal(g *AutoGroup, node *AutoNode, resMessage interface{})  {
+//	// sync off
+//	// sync on
+//	// write q
+//	if !node.syncrep() {
+//		// unsync => sync
+//		if node.walconn() {
+//			// TODO: turn syncrep on
+//		} else {
+//			// not syncrep and walconn is off
+//			// do nothing
+//		}
+//	} else {
+//		// sync => {unsync | write & ready}
+//		if node.time_walconn_disconnected == node.time_updated {
+//			if g.sync_state != GS_READY {
+//				// try to send write query and become ready for promotion
+//				// TODO: if received command is write-query
+//				if node.lastCMD() == 1 {
+//					g.sync_state = GS_READY
+//					g.save()
+//				} else {
+//					// if last command is not write query, send it
+//					// TODO: send write-query
+//				}
+//			}
+//		} else if node.should_sync_off() { // replication is not established in last cycle, considering sync off
+//			if g.sync_state == GS_P_SYNC || g.sync_state == GS_READY {
+//				g.sync_state = GS_UNSYNC
+//				g.save()
+//			}
+//			// TODO: turn syncrep off
+//		}
+//	}
+//}
+//
+//func secondary_normal(g *AutoGroup, node *AutoNode, resMessage interface{})  {
+//	// do checks and updates, no action
+//}
+//func demoted_all_state(g *AutoGroup, node *AutoNode, resMessage interface{})  {
+//	// should not receive messages
+//}
+//
+//func target_promoting(g *AutoGroup, node *AutoNode, resMessage interface{})  {
+//	assert(node.role != 'p')
+//
+//
+//}
