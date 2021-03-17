@@ -2,101 +2,81 @@ package monitor
 
 import "time"
 
-var node_infos = [2]auto_node {
-	{
-		"data-m",
-		"localhost",
-		"/Users/hawu/workspace/postgresql/datadirs/data-m",
-		5432,
-		nil,
-	},
-	{
-		"data-s",
-		"localhost",
-		"/Users/hawu/workspace/postgresql/datadirs/data-s",
-		5433,
-		nil,
-	},
-}
-
-func mock_primary() *auto_node {
+func mockPrimary() *AutoNode {
 	now := time.Now()
-	node := &node_infos[0]
-	status := node_status{
-		role: '?',
-		walconn: false,
-		health:false,
-		syncrep: "",
-		sync_state: "",
-		lsn: "",
-		time_updated: now,
-		time_disconnect:now,
-		cmd_chan:make(chan ActionItem, 1),
-		T: time.NewTimer(time.Hour * 1000000),
+	node := AutoNode{
+		ID: 1,
+		host: "localhost",
+		pgdata: "/Users/hawu/workspace/postgresql/datadirs/data-m",
+		port: 5432,
+		role: 'p',
+		valid: false,
 		quit: false,
-	}
-	status.T.Stop()
+		_has_temp_table:false,
 
-	state := auto_node_state{
-		node_status: status,
+		time_updated:now,
+		time_walconn_updated:now,
+
+		cmdMessage:make(chan CommandMessage),
+		T: time.NewTimer(time.Hour),
+
 	}
-	node.state = &state
-	return node
+	node.T.Stop()
+
+	return &node
 }
-func mock_secondary() *auto_node {
+func mockSecondary() *AutoNode {
 	now := time.Now()
-	node := &node_infos[1]
-	status := node_status{
-		role: '?',
-		walconn: false,
-		health:false,
-		syncrep: "",
-		sync_state: "",
-		lsn: "",
-		time_updated: now,
-		time_disconnect:now,
-		cmd_chan:make(chan ActionItem, 1),
-		T: time.NewTimer(time.Hour * 1000000),
+	node := AutoNode{
+		ID: 2,
+		host: "localhost",
+		pgdata: "/Users/hawu/workspace/postgresql/datadirs/data-m",
+		port: 5433,
+		valid: false,
 		quit: false,
+		role:'s',
+		_has_temp_table:false,
+
+		time_updated:now,
+		time_walconn_updated:now,
+
+		cmdMessage:make(chan CommandMessage),
+		T: time.NewTimer(time.Hour),
+
 	}
-	status.T.Stop()
-	state := auto_node_state{
-		node_status: status,
-	}
-	node.state = &state
-	return node
+	node.T.Stop()
+
+	return &node
 }
 
-func buildGroupSingle() *auto_group {
-	g := new(auto_group)
-	node0 := mock_primary()
-	//node1 := mock_secondary()
-	g.nodes = []*auto_node {node0}
+func MockGroupSingle() *AutoGroup {
+	g := new(AutoGroup)
+	node0 := mockPrimary()
+	node0.update = node_single
+	g.active_nodes = append(g.active_nodes, node0)
 
-	g.ID = 1
-	g.sysid = ""
-	g.state = G_STATE_SINGLE
 	g.target = node0
-	g.wal_sync = '?'
-	g.quit = make(chan bool)
-	g.resMessage = make(chan ServerResponseMessage, 1)
+	g.targetID = node0.ID
+	g.running_state = GRS_SINGLE
+	g.sync_state = GSS_UNKNOWN
+	g.resMessageChan = make(chan ResponseMessage, 1)
 
 	return g
 }
 
-func buildGroupNormal() *auto_group {
-	g := new(auto_group)
-	node0 := mock_primary()
-	node1 := mock_secondary()
-	g.nodes = []*auto_node {node0, node1}
+func MockGroupNormal() *AutoGroup {
+	g := new(AutoGroup)
+	node0 := mockPrimary()
+	node1 := mockSecondary()
+	node0.update = primary_normal
+	node1.update = secondary_normal
+	g.active_nodes = append(g.active_nodes, node0, node1)
 
-	g.ID = 1
-	g.sysid = ""
-	g.state = G_STATE_NORMAL
 	g.target = node0
-	g.wal_sync = '?'
-	g.quit = make(chan bool)
-	g.resMessage = make(chan ServerResponseMessage, 1)
+	g.targetID = node0.ID
+	g.running_state = GRS_NORMAL
+	g.sync_state = GSS_UNKNOWN
+	g.resMessageChan = make(chan ResponseMessage, 1)
 
 	return g
 }

@@ -2,7 +2,7 @@ package monitor
 
 import "log"
 
-func sanity_check(g *auto_group, srm *ServerResponseMessage)  {
+func sanity_check(g *AutoGroup, resMessage *ResponseMessage)  {
 
 }
 
@@ -17,8 +17,11 @@ func assert_imply(p, q bool) {
 
 const _debug_enabled = true
 
-func debug(format string, args...interface{}) {
+func debug4(format string, args...interface{}) {
 	if _debug_enabled {
-		log.Printf(format, args)
+		if n := len(format); n > 0 && format[n-1] != '\n' {
+			format += "\n"
+		}
+		log.Printf(format, args...)
 	}
 }

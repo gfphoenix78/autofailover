@@ -7,7 +7,7 @@ import (
 	"net/http"
 )
 
-func (ctl *auto_monitor)RunControlServer() {
+func (ctl *Manager)RunControlServer() {
 	listener, err := net.Listen("tcp", "localhost:8888")
 	if err != nil {
 		log.Fatalln(err)
@@ -24,7 +24,7 @@ func (ctl *auto_monitor)RunControlServer() {
 	}
 }
 
-func (ctl *auto_monitor)new_group(w http.ResponseWriter, r *http.Request)  {
+func (ctl *Manager)new_group(w http.ResponseWriter, r *http.Request)  {
 	var err error
 	err = r.ParseForm()
 	if err != nil {
@@ -39,20 +39,20 @@ func (ctl *auto_monitor)new_group(w http.ResponseWriter, r *http.Request)  {
 	msg := fmt.Sprintf("req => new group: '%s'", name)
 	w.Write([]byte(msg))
 }
-func (ctl *auto_monitor)del_group(w http.ResponseWriter, r *http.Request)  {
+func (ctl *Manager)del_group(w http.ResponseWriter, r *http.Request)  {
 
 }
 
-func (ctl *auto_monitor)add_group_node(w http.ResponseWriter, r *http.Request)  {
+func (ctl *Manager)add_group_node(w http.ResponseWriter, r *http.Request)  {
 
 }
-func (ctl *auto_monitor)del_group_node(w http.ResponseWriter, r *http.Request)  {
+func (ctl *Manager)del_group_node(w http.ResponseWriter, r *http.Request)  {
 
 }
 
-func (ctl *auto_monitor)show_group(w http.ResponseWriter, r *http.Request)  {
+func (ctl *Manager)show_group(w http.ResponseWriter, r *http.Request)  {
 
 }
-func (ctl *auto_monitor)show_groups(w http.ResponseWriter, r *http.Request)  {
+func (ctl *Manager)show_groups(w http.ResponseWriter, r *http.Request)  {
 
 }

@@ -30,7 +30,29 @@ const (
 	MRC_ERR_SIZE
 )
 
+func (mt messageType)String() string {
+	names := [...]string {
+		"NOOP",
+		"STATUS",
+		"SYNCREP",
+		"UNSYNCREP",
+		"PROMOTE",
+		"WRITE_QUERY",
+		"EXIT",
+	}
+	if int(mt) < len(names) {
+		return names[mt]
+	}
+	return "UNKNOWN"
+}
+
 func (rc returnCode)Error() string {
+	return rc.name()
+}
+func (rc returnCode)String() string {
+	return rc.name()
+}
+func (rc returnCode)name() string {
 	messages := [...]string {
 		"OK",
 		"General Error",
@@ -54,16 +76,16 @@ type ResponseMessage struct {
 	returnCode
 
 	role byte	 // 'p' or 's'
-	syncrep byte // 't' or 'f'
-	walconn byte // 't' or 'f'
+	walconn bool // true if the walconn is alive
+	syncrep string
 }
 
 type CommandMessage struct {
 	messageType
 	delay time.Duration
 	// private
-	owner *AutoNode
-	sql string
+	//owner *AutoNode
+	//sql string
 }
 type AutoNode struct {
 	/// unique reference to the node
@@ -76,8 +98,8 @@ type AutoNode struct {
 	valid bool // status has been updated
 	quit bool  // to indicate the node should exit
 	role byte
-	syncrep_ byte
-	walconn_ byte
+	walconn bool
+	syncrep string
 
 	_has_temp_table bool // for write query
 	time_updated time.Time
@@ -93,24 +115,23 @@ func (node *AutoNode)String() string {
 	return fmt.Sprintf("node-%d", node.ID)
 }
 
-func (node *AutoNode)syncrep() bool {
-	return node.syncrep_ == 't'
-}
-func (node *AutoNode)walconn() bool {
-	return node.walconn_ == 't'
-}
+//func (node *AutoNode)syncrep() bool {
+//	return node.syncrep_ == '*'
+//}
+
 func (node *AutoNode)lastCMD() int {
 	return 0
 }
 func (node *AutoNode)should_sync_off() bool {
-	return false
+	// walconn is false and it disconnects for some time
+	return !node.walconn && node.time_walconn_updated.Before(node.time_updated)
 }
-type GroupSyncState int
+type GroupSyncState byte
 const (
-	GS_UNKNOWN GroupSyncState = iota
-	GS_UNSYNC  // primary has turned off syncrep, needs to turn it on first.
-	GS_P_SYNC // primary has turned on syncrep, needs to write query.
-	GS_READY // received write query, group is ready for promotion.
+	GSS_UNKNOWN  GroupSyncState = iota
+	GSS_P_UNSYNC  // primary has turned off syncrep, needs to turn it on first.
+	GSS_P_SYNC    // primary has turned on syncrep, needs to write query.
+	GSS_G_SYNC    // received write query, group is ready for promotion.
 )
 type GroupRunningState int
 const (
@@ -120,8 +141,29 @@ const (
 	GRS_PROMOTING
 )
 
+func (gss GroupSyncState)String() string {
+	names := [...]string{
+		"UNKNOWN",
+		"P_UNSYNC",
+		"P_SYNC",
+		"G_SYNC",
+	}
+	return names[gss]
+}
+func (grs GroupRunningState) String() string {
+	names := [...]string {
+		"INIT0",
+		"SINGLE",
+		"NORMAL",
+		"PROMOTING",
+	}
+	return names[grs]
+}
+
 type AutoGroup struct {
 	target *AutoNode
+
+	resMessageChan chan ResponseMessage
 
 	active_nodes []*AutoNode
 	demoted_nodes []*AutoNode
@@ -134,14 +176,29 @@ type AutoGroup struct {
 func (g *AutoGroup)save()  {
 
 }
-func (g *AutoGroup)should_promote() (bool, *AutoNode) {
-	return false, nil
+func (g *AutoGroup)should_promote() (*AutoNode, bool) {
+	x := g.target
+	assert(x != nil)
+	now := time.Now()
+	if now.Sub(x.time_updated) > 10 * time.Second {
+		for _, node := range g.active_nodes {
+			if x == node {
+				continue
+			}
+			assert(node.role != 'p')
+			if now.Sub(node.time_updated) < 3*time.Second &&
+				node.time_updated.Sub(node.time_walconn_updated) > 3*time.Second {
+				return node, true
+			}
+		}
+	}
+	return nil, false
 }
 func (g *AutoGroup)prepare_promote1(node *AutoNode, cmd *CommandMessage) {
 	assert(g.target == node)
 	assert(g.targetID == node.ID)
-	g.running_state = G_STATE_PROMOTING
-	g.sync_state = GS_UNKNOWN
+	g.running_state = GRS_PROMOTING
+	g.sync_state = GSS_UNKNOWN
 	for _, xx := range g.active_nodes {
 		xx.update = secondary_promoting
 	}
@@ -178,7 +235,7 @@ func (g *AutoGroup)prepare_promote_normal(node *AutoNode, cmd *CommandMessage) *
 
 	g.target = node
 	g.targetID = node.ID
-	g.running_state = G_STATE_PROMOTING
+	g.running_state = GRS_PROMOTING
 	for _, xx := range g.active_nodes {
 		xx.update = secondary_promoting
 	}
@@ -194,7 +251,7 @@ func node_single(g *AutoGroup, node *AutoNode, resMessage *ResponseMessage, cmd 
 	// do checks, update, actions
 	// sync => unsync
 	// promote
-
+	debug4("run node_single...")
 	role := byte('?')
 	now := time.Now()
 	if !resMessage.OK() {
@@ -209,17 +266,17 @@ func node_single(g *AutoGroup, node *AutoNode, resMessage *ResponseMessage, cmd 
 		role = node.role
 	} else {
 		role = resMessage.role
-		node.syncrep_ = resMessage.syncrep
-		node.walconn_ = resMessage.walconn
+		node.syncrep = resMessage.syncrep
+		node.walconn = resMessage.walconn
 		node.time_updated = now
-		if !node.valid || node.walconn() {
+		if !node.valid || node.walconn {
 			node.time_walconn_updated = now
 		}
 	}
 
 	if role != 'p' {
 		g.prepare_promote1(node, cmd)
-	} else if node.syncrep() {
+	} else if node.syncrep == "*" {
 		cmd.messageType = MSG_UNSYNCREP
 		cmd.delay = 0
 	} else {
@@ -233,11 +290,13 @@ func primary_normal(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage, 
 	// sync off
 	// sync on
 	// write q
+	cmd.messageType = MSG_STATUS
+	cmd.delay = 3 * time.Second
+debug4("primary_normal...")
 	if !resMessage.OK() {
 		log.Printf("failed to run command '%s' from node %s, %s\n",
 					resMessage.messageType, node.String(), resMessage.returnCode)
-		cmd.messageType = MSG_STATUS
-		cmd.delay = 3 * time.Second
+
 		return
 	}
 	if resMessage.role != 'p' {
@@ -255,17 +314,17 @@ func primary_normal(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage, 
 	}
 
 	//node.role = resMessage.role // should always the same value
-	node.syncrep_ = resMessage.syncrep
-	node.walconn_ = resMessage.walconn
+	node.syncrep = resMessage.syncrep
+	node.walconn = resMessage.walconn
 	node.time_updated = now
 	// time_walconn_disconnected is update if current walconn is up
-	if node.walconn() {
+	if node.walconn {
 		node.time_walconn_updated = now
 	}
-	
-	if !node.syncrep() {
+	log.Println("node.time_walconn_updated:", node.time_walconn_updated)
+	if node.syncrep == "" {
 		// unsync => sync
-		if node.walconn() {
+		if node.walconn {
 			cmd.messageType = MSG_SYNCREP
 			cmd.delay = 0
 		} else {
@@ -274,11 +333,11 @@ func primary_normal(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage, 
 		}
 	} else {
 		// sync => {unsync | write & ready}
-		if node.time_walconn_updated == node.time_updated {
-			if g.sync_state != GS_READY {
+		if node.time_walconn_updated == node.time_updated && node.walconn {
+			if g.sync_state != GSS_G_SYNC {
 				// try to send write query and become ready for promotion
 				if resMessage.messageType == MSG_WRITE_QUERY {
-					g.sync_state = GS_READY
+					g.sync_state = GSS_G_SYNC
 					g.save()
 				} else {
 					// if last command is not write query, send it
@@ -287,8 +346,8 @@ func primary_normal(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage, 
 				}
 			}
 		} else if node.should_sync_off() { // replication is not established in last cycle, considering sync off
-			if g.sync_state == GS_P_SYNC || g.sync_state == GS_READY {
-				g.sync_state = GS_UNSYNC
+			if g.sync_state == GSS_P_SYNC || g.sync_state == GSS_G_SYNC {
+				g.sync_state = GSS_P_UNSYNC
 				g.save()
 			}
 			cmd.messageType = MSG_UNSYNCREP
@@ -301,6 +360,10 @@ func secondary_normal(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage
 	// do checks and updates, no action
 	cmd.messageType = MSG_STATUS
 	cmd.delay = 3 * time.Second // default interval to collect status from the secondary
+	debug4("secondary_normal: role=%v, syncrep=%v walconn=%v",
+		resMessage.role,
+		resMessage.syncrep,
+		resMessage.walconn)
 	if !resMessage.OK() {
 		log.Printf("failed to run command '%s' from node %s, %s\n",
 			resMessage.messageType, node.String(), resMessage.returnCode)
@@ -321,22 +384,24 @@ func secondary_normal(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage
 	}
 
 	//node.role = resMessage.role // should always the same value
-	node.syncrep_ = resMessage.syncrep
-	node.walconn_ = resMessage.walconn
+	node.syncrep = resMessage.syncrep
+	node.walconn = resMessage.walconn
 	node.time_updated = now
 	// time_walconn_disconnected is update if current walconn is up
-	if node.walconn() {
+	if node.walconn {
 		node.time_walconn_updated = now
 	}
 	
 	// check promote
 	assert(g.target != nil)
+	log.Println(g.target, g.target.role)
 	assert(g.target.role == 'p')
-	if ok, x := g.should_promote(); ok {
+	if x, ok := g.should_promote(); ok && x == node {
 		// promote x
 		// demote p.target
-		p := g.prepare_promote_normal(x, cmd)
-		p.quit = true
+		g.prepare_promote_normal(x, cmd)
+		cmd.messageType = MSG_PROMOTE
+		cmd.delay = 0
 
 		g.save()
 	}
@@ -344,6 +409,8 @@ func secondary_normal(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage
 func demoted_all_state(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage, cmd *CommandMessage)  {
 	// should not receive messages
 	log.Println("demoted node in a group, ignore")
+	cmd.messageType = MSG_EXIT
+	cmd.delay = 0
 }
 
 func target_promoting(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage, cmd *CommandMessage)  {
@@ -365,31 +432,31 @@ func target_promoting(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage
 		node.valid = true
 		node.time_walconn_updated = now
 	}
-	node.syncrep_ = resMessage.syncrep
-	node.walconn_ = resMessage.walconn
+	node.syncrep = resMessage.syncrep
+	node.walconn = resMessage.walconn
 	node.time_updated = now
-	if node.walconn() {
+	if node.walconn {
 		node.time_walconn_updated = now
 	}
 
 	if resMessage.role == 'p' {
 		// finish promotion
 		node.role = 'p'
-		if node.syncrep() {
-			g.sync_state = GS_P_SYNC
+		if node.syncrep == "*" {
+			g.sync_state = GSS_P_SYNC
 		} else {
-			g.sync_state = GS_UNSYNC
+			g.sync_state = GSS_P_UNSYNC
 		}
 		switch len(g.active_nodes) {
 		case 1: {
-			g.running_state = G_STATE_SINGLE
+			g.running_state = GRS_SINGLE
 			node.update = node_single
 		}
 		case 0:
 			// what the hell
 			panic("No active nodes, WTF")
 		default:
-			g.running_state = G_STATE_NORMAL
+			g.running_state = GRS_NORMAL
 			for _, xx := range g.active_nodes {
 				assert((xx.role == 'p' && xx == node) || xx.role == 's')
 				xx.update = secondary_normal
@@ -405,4 +472,39 @@ func target_promoting(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage
 }
 func secondary_promoting(g *AutoGroup, node *AutoNode, resMessage  *ResponseMessage, cmd *CommandMessage)  {
 	log.Println("more secondaries in a group, ignore")
+}
+
+func (g *AutoGroup)init_loop() {
+	cmd := CommandMessage{
+		messageType: MSG_STATUS,
+		delay:0,
+	}
+	for i, n := 0, len(g.active_nodes); i<n; i++ {
+		x := g.active_nodes[i]
+		go start_worker(x, g.resMessageChan)
+		x.cmdMessage <- cmd
+	}
+}
+
+func (g *AutoGroup)Loop()  {
+
+	var cmdMessage CommandMessage
+	var resMessage ResponseMessage
+
+	g.init_loop()
+
+	for {
+		resMessage = <-g.resMessageChan
+		sender := resMessage.owner
+		assert(sender != nil)
+		sanity_check(g, &resMessage)
+		sender.update(g, sender, &resMessage, &cmdMessage)
+		log.Println(sender, cmdMessage.messageType, cmdMessage.delay)
+		sender.cmdMessage <- cmdMessage
+
+		log.Printf("%s role='%c', syncrep='%s', walconn='%t'\n",
+					sender, sender.role, sender.syncrep, sender.walconn)
+		log.Printf("target='%s', sync state='%s', len(nodes)=%d\n",
+					g.target, g.sync_state, len(g.active_nodes))
+	}
 }

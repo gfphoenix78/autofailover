@@ -206,7 +206,7 @@ elog(LOG, "max_wal_senders=%d", max_wal_senders);
     if (WalSndCtl->sync_standbys_defined)
       syncrep = "*";
     else
-      syncrep = "";
+      syncrep = "f";
     LWLockRelease(SyncRepLock);
   }
   else
