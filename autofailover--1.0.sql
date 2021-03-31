@@ -17,3 +17,8 @@ create function autofailover_execute(IN cmd text, IN last_role text)
 returns table(role text, syncrep text, sync_state text, lsn pg_lsn, walconn bool)
 LANGUAGE C STRICT SECURITY DEFINER
 AS 'MODULE_PATHNAME', $$autofailover_execute$$;
+
+create function test_udf()
+returns record
+language c strict security definer
+as 'MODULE_PATHNAME', $$test_udf$$;

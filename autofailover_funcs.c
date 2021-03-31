@@ -36,6 +36,7 @@ PG_MODULE_MAGIC;
 //PG_FUNCTION_INFO_V1(collect_status);
 //PG_FUNCTION_INFO_V1(execute_action);
 PG_FUNCTION_INFO_V1(autofailover_execute);
+PG_FUNCTION_INFO_V1(test_udf);
 
 static void handle_promote(void);
 static void handle_syncrep(void);
@@ -340,7 +341,7 @@ handle_unsyncrep()
 
 // todo: log the possible error
 static void
-SignalPromote(void)
+signal_promote(void)
 {
   FILE *fd;
   if ((fd = fopen(PROMOTE_SIGNAL_FILE, "w")))
@@ -382,7 +383,7 @@ handle_promote()
     // todo: create replication slot
 //    CreateReplicationSlotOnPromote(INTERNAL_WAL_REPLICATION_SLOT_NAME);
 
-    SignalPromote();
+    signal_promote();
   }
   else
   {
@@ -433,3 +434,136 @@ handle_demote()
 //
 //	PG_RETURN_VOID();
 //}
+
+
+//static GpSegConfigEntry *
+//readGpSegConfigFromExternal(int *total_dbs)
+//{
+//    PGconn   *tmpconn;
+//    GpSegConfigEntry*configs;
+//    GpSegConfigEntry*config;
+//    intarray_size;
+//    int                 i;
+//
+//    array_size = 500;
+//    configs = palloc0(sizeof(GpSegConfigEntry) * array_size);
+//    PGresult    *result;
+//
+//    tmpconn = PQconnectdb(ExternalGpsegconfigConnInfo);
+//    if (!tmpconn)
+//    {
+//        elog(ERROR, "could not connect to server");
+//    }
+//
+//    if (PQstatus(tmpconn) != CONNECTION_OK)
+//    {
+//        PQfinish(tmpconn);
+//        elog(ERROR, "could not connect to server: %s", PQerrorMessage(tmpconn));
+//    }
+//
+//    result = PQexec(tmpconn, "select * from gp_segment_configuration");
+//    if (PQresultStatus(result) != PGRES_TUPLES_OK)
+//    {
+//        PQclear(result);
+//        PQfinish(tmpconn);
+//        elog(ERROR, "result is incorrect: %s", PQerrorMessage(tmpconn));
+//    }
+//    if (PQntuples(result) <= 0 || PQnfields(result) != Natts_gp_segment_configuration)
+//    {
+//        PQclear(result);
+//        elog(ERROR, "result is incorrect");
+//    }
+//
+//    for (i=0; i<PQntuples(result); i++)
+//    {
+//        config = &configs[i];
+//        config->dbid = atoi(PQgetvalue(result, i, Anum_gp_segment_configuration_dbid-1));
+//        config->segindex = atoi(PQgetvalue(result, i, Anum_gp_segment_configuration_content-1));
+//        config->role = PQgetvalue(result, i, Anum_gp_segment_configuration_role-1)[0];
+//        config->preferred_role = PQgetvalue(result, i, Anum_gp_segment_configuration_preferred_role-1)[0];
+//        config->mode = PQgetvalue(result, i, Anum_gp_segment_configuration_mode-1)[0];
+//        config->status = PQgetvalue(result, i, Anum_gp_segment_configuration_status-1)[0];
+//        config->port = atoi(PQgetvalue(result, i, Anum_gp_segment_configuration_port-1));
+//        config->hostname = pstrdup(PQgetvalue(result, i, Anum_gp_segment_configuration_hostname-1));
+//        config->address = pstrdup(PQgetvalue(result, i, Anum_gp_segment_configuration_address-1));
+//        config->datadir = pstrdup(PQgetvalue(result, i, Anum_gp_segment_configuration_datadir-1));
+//
+//    }
+//    *total_dbs = i;
+//
+//    PQclear(result);
+//    PQfinish(tmpconn);
+//    return configs;
+//}
+
+struct foobar
+{
+  char ch;
+  int id;
+  int N;
+  int index;
+  TupleDesc tupledesc;
+};
+
+Datum
+test_udf(PG_FUNCTION_ARGS)
+{
+    FuncCallContext *funcctx;
+    TupleDesc tupledesc;
+    struct foobar *segcontext;
+
+    if (SRF_IS_FIRSTCALL())
+    {
+        TupleDesc tupledesc;
+        MemoryContext oldcontext;
+        funcctx = SRF_FIRSTCALL_INIT();
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        if (get_call_result_type(fcinfo, NULL, &tupledesc) != TYPEFUNC_COMPOSITE)
+            ereport(ERROR, (errmsg("return type must be a row type")));
+
+        #if 1
+        tupledesc = CreateTemplateTupleDesc(2);
+        TupleDescInitEntry(tupledesc, (AttrNumber)1,
+                          "dbid", INT2OID, -1, 0);
+        TupleDescInitEntry(tupledesc, (AttrNumber)2,
+                          "desc", TEXTOID, -1, 0);
+
+        BlessTupleDesc(tupledesc);
+        #endif
+
+        segcontext = palloc(sizeof(*segcontext));
+        segcontext->id = 1;
+        segcontext->ch = 'a';
+        segcontext->N = 10;
+        segcontext->index = 0;
+        segcontext->tupledesc = tupledesc;
+        funcctx->user_fctx = segcontext;
+//        funcctx->tuple_desc = tupledesc;
+        ReturnSetInfo *rsinfo = (ReturnSetInfo*)fcinfo->resultinfo;
+//        rsinfo->setDesc = tupledesc;
+        MemoryContextSwitchTo(oldcontext);
+    }
+    funcctx = SRF_PERCALL_SETUP();
+    segcontext = funcctx->user_fctx;
+
+    if (segcontext->index < segcontext->N)
+    {
+        Datum values[2];
+        bool nulls[2] = {0};
+        char buffer[16];
+        HeapTuple heapTuple;
+        Datum result;
+        int index = segcontext->index;
+        snprintf(buffer, sizeof(buffer), "ch-%c", (char)(segcontext->ch + index));
+        values[0] = Int16GetDatum(segcontext->id + index);
+        values[1] = CStringGetTextDatum(buffer);
+        heapTuple = heap_form_tuple(segcontext->tupledesc, values, nulls);
+        result = HeapTupleGetDatum(heapTuple);
+
+        segcontext->index = index + 1;
+
+        SRF_RETURN_NEXT(funcctx, result);
+    }
+    SRF_RETURN_DONE(funcctx);
+}
